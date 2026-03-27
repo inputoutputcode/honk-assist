@@ -1,0 +1,260 @@
+diff --git a/scripts/meetingbaas.py b/scripts/meetingbaas.py
+index 9f58554..29192b3 100644
+--- a/scripts/meetingbaas.py
++++ b/scripts/meetingbaas.py
+@@ -1,6 +1,6 @@
+ import argparse
+ import asyncio
+-import os
++import json
+ import os
+ from datetime import datetime
+ 
+@@ -16,11 +16,17 @@ from pipecat.pipeline.runner import PipelineRunner
+ from pipecat.pipeline.task import PipelineParams, PipelineTask
+ from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+ from pipecat.serializers.protobuf import ProtobufFrameSerializer
+-from pipecat.services.cartesia.tts import CartesiaTTSService
++from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
++from pipecat.services.deepgram.tts import DeepgramTTSService
+ from pipecat.services.deepgram.stt import DeepgramSTTService
+ 
+ # from pipecat.services.gladia.stt import GladiaSTTService
+-from pipecat.services.openai.llm import OpenAILLMService
++from pipecat.services.anthropic.llm import AnthropicLLMService
++
++# OpenClaw bridge — replaces direct Anthropic calls with an OpenClaw agent
++# that has persistent memory, wake word filtering, and business context
++from core.openclaw_llm import OpenClawLLMService
++from core.wake_word_filter import WakeWordFilter
+ from pipecat.transports.network.websocket_client import (
+     WebsocketClientParams,
+     WebsocketClientTransport,
+@@ -103,6 +109,7 @@ async def main(
+     streaming_audio_frequency: str = "24khz",
+     websocket_url: str = "",
+     enable_tools: bool = True,
++    persona_data_json: str = "",
+ ):
+     """
+     Run the MeetingBaas bot with specified configurations
+@@ -162,7 +169,7 @@ async def main(
+                     threshold=0.5,
+                     min_speech_duration_ms=250,
+                     min_silence_duration_ms=100,
+-                    min_volume=0.6,
++                    min_volume=0.001,
+                 ),
+             ),
+             audio_in_passthrough=True,
+@@ -192,12 +199,28 @@ async def main(
+     async def on_connection_error(transport, error):
+         log_and_flush(logging.ERROR, f"[WEBSOCKET] Connection error: {error}")
+ 
++    # Try to load persona from folder first, fall back to command-line JSON data
++    persona = None
+     persona_manager = PersonaManager()
+-    persona = persona_manager.get_persona(persona_name)
++    try:
++        persona = persona_manager.get_persona(persona_name)
++        log_and_flush(logging.INFO, f"[PERSONA] Loaded persona from folder: {persona_name}")
++    except Exception:
++        pass
++    
+     if not persona:
+-        log_and_flush(logging.ERROR, f"[ERROR] Persona '{persona_name}' not found")
+-        return
+-    log_and_flush(logging.INFO, f"[PERSONA] Loaded persona: {persona_name}")
++        # Use persona data passed via parameter (dynamic/temporary persona)
++        log_and_flush(logging.INFO, f"[PERSONA] No folder persona found, checking JSON data (length={len(persona_data_json) if persona_data_json else 0})")
++        if persona_data_json:
++            try:
++                persona = json.loads(persona_data_json) if isinstance(persona_data_json, str) else persona_data_json
++                log_and_flush(logging.INFO, f"[PERSONA] Using dynamic persona from JSON: {persona.get('name', persona_name)}")
++            except Exception as e:
++                log_and_flush(logging.ERROR, f"[ERROR] Failed to parse persona JSON: {e}")
++        
++        if not persona:
++            log_and_flush(logging.ERROR, f"[ERROR] Persona '{persona_name}' not found and no JSON data available")
++            return
+ 
+     additional_content = persona.get("additional_content", "")
+     if additional_content:
+@@ -205,24 +228,43 @@ async def main(
+     else:
+         log_and_flush(logging.INFO, "[PERSONA] No additional content found for persona")
+ 
+-    # Use the voice ID from the persona data, falling back to env var if not set
+-    voice_id = persona.get("cartesia_voice_id") or os.getenv("CARTESIA_VOICE_ID")
+-    log_and_flush(logging.INFO, f"[PERSONA] Using voice ID: {voice_id}")
+-
+-    tts = CartesiaTTSService(
+-        api_key=os.getenv("CARTESIA_API_KEY"),
+-        voice_id=voice_id,
+-        sample_rate=output_sample_rate,
+-        speed="normal",
+-    )
+-    log_and_flush(logging.INFO, f"[TTS] Cartesia TTS initialized with sample_rate={output_sample_rate}, voice_id={voice_id}")
+-
+-    llm = OpenAILLMService(
+-        api_key=os.getenv("OPENAI_API_KEY"),
+-        model="gpt-4-turbo-preview",
+-        run_in_parallel=False,
+-    )
+-    log_and_flush(logging.INFO, f"[LLM] OpenAI LLM initialized with model=gpt-4-turbo-preview")
++    # Try ElevenLabs first, fall back to Deepgram TTS
++    voice_id = os.getenv("ELEVENLABS_VOICE_ID", "9IzcwKmvwJcw58h3KnlH")
++    try:
++        tts = ElevenLabsTTSService(
++            api_key=os.getenv("ELEVENLABS_API_KEY"),
++            voice_id=voice_id,
++            sample_rate=output_sample_rate,
++        )
++        log_and_flush(logging.INFO, f"[TTS] ElevenLabs TTS initialized with sample_rate={output_sample_rate}, voice_id={voice_id}")
++    except Exception as e:
++        log_and_flush(logging.WARNING, f"[TTS] ElevenLabs failed ({e}), falling back to Deepgram TTS")
++        tts = DeepgramTTSService(
++            api_key=os.getenv("DEEPGRAM_API_KEY"),
++            voice="aura-2-helena-en",
++            sample_rate=output_sample_rate,
++        )
++        log_and_flush(logging.INFO, f"[TTS] Deepgram TTS fallback initialized")
++
++    # --- LLM Selection: OpenClaw agent (preferred) or direct Anthropic (fallback) ---
++    use_openclaw = os.getenv("OPENCLAW_GATEWAY_TOKEN", "").strip() != ""
++    if use_openclaw:
++        llm = OpenClawLLMService(
++            gateway_url=os.getenv("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789"),
++            gateway_token=os.getenv("OPENCLAW_GATEWAY_TOKEN"),
++            agent_id=os.getenv("OPENCLAW_AGENT_ID", "honkassist"),
++        )
++        log_and_flush(logging.INFO,
++            f"[LLM] OpenClaw agent bridge initialized "
++            f"(gateway={os.getenv('OPENCLAW_GATEWAY_URL', 'http://127.0.0.1:18789')}, "
++            f"agent={os.getenv('OPENCLAW_AGENT_ID', 'honkassist')})"
++        )
++    else:
++        llm = AnthropicLLMService(
++            api_key=os.getenv("ANTHROPIC_API_KEY"),
++            model="claude-opus-4-20250514",
++        )
++        log_and_flush(logging.INFO, "[LLM] Anthropic LLM initialized (direct, no OpenClaw bridge)")
+ 
+     if enable_tools:
+         log_and_flush(logging.INFO, "[TOOLS] Registering function tools")
+@@ -281,19 +323,27 @@ async def main(
+     #     language=language,  # Use language from persona
+     # )
+ 
+-    bot_name = persona_name or "Bot"
++    bot_name = persona_name or "HonkAssist"
+     log_and_flush(logging.INFO, f"[BOT] Using bot name: {bot_name}")
+ 
+-    # Create a more comprehensive system prompt
+-    system_content = persona["prompt"]
+-
+-    # Add additional context if available
++    # Use the user's prompt directly — no generic meeting bot fluff
++    system_content = f"""You are {bot_name}, a voice AI assistant in a meeting.
++
++CRITICAL RULES:
++- Your name is {bot_name}. Only respond when someone says your name or directly addresses you.
++- If nobody is talking to you, stay silent. Do NOT repeat yourself or volunteer unsolicited comments.
++- Keep responses SHORT (1-3 sentences). Everything you say is spoken aloud.
++- Do NOT use markdown, emojis, special characters, or code blocks.
++- Do NOT say you are an AI assistant or mention your limitations.
++- Be natural, conversational, and helpful.
++- If you don't understand, ask for clarification.
++- Remember context from the conversation — learn names, topics, and preferences as they come up.
++
++USER'S INSTRUCTIONS:
++{persona["prompt"]}
++"""
+     if additional_content:
+-        system_content += f"\n\nYou are {persona_name}\n\n{DEFAULT_SYSTEM_PROMPT}\n\n"
+-        system_content += "You have the following additional context. USE IT TO INFORM YOUR RESPONSES:\n\n"
+-        system_content += additional_content
+-        system_content += "You are a meeting bot. You are in a meeting with a group of people. You are here to help the group. You are not the host of the meeting. You are not the organizer of the meeting. You are not the participant in the meeting. You are the meeting bot."
+-        system_content += "YOU ARE HELP TO HELP. KEEP IT SHORT. EVERYTHING YOU SAY WILL BE REPEATED BACK TO THE GROUP OUT LOUD so DO NOT add PUNCTUATION OR CAPS. JUST SAY WHAT YOU NEED TO SAY IN A CONCISE MANNER."
++        system_content += f"\nADDITIONAL CONTEXT:\n{additional_content}\n"
+ 
+ 
+     # Set up messages
+@@ -325,14 +375,23 @@ async def main(
+     # Remove the LoggingStep wrapper - it doesn't properly proxy all methods
+     # Instead, we'll log in the pipeline components themselves if needed
+     
++    # Wake word filter: only passes transcripts containing "Honk" to the LLM.
++    # Sits between STT and user_aggregator to filter before context assembly.
++    wake_filter = WakeWordFilter(enabled=use_openclaw)
++    log_and_flush(logging.INFO,
++        f"[PIPELINE] Wake word filter: {'ENABLED' if use_openclaw else 'DISABLED'} "
++        f"(word='{os.getenv('HONK_WAKE_WORD', 'Honk')}')"
++    )
++
+     pipeline = Pipeline([
+-        transport.input(),   # Add transport input to receive audio/data
+-        stt,
+-        user_aggregator,
+-        llm,
+-        tts,
+-        assistant_aggregator,
+-        transport.output(),  # Add transport output to send audio/data
++        transport.input(),   # Audio from meeting
++        stt,                 # Deepgram STT → transcription frames
++        wake_filter,         # Only pass through when "Honk" is spoken
++        user_aggregator,     # Assemble user context
++        llm,                 # OpenClaw agent (or Anthropic fallback)
++        tts,                 # ElevenLabs TTS
++        assistant_aggregator,# Assemble assistant context
++        transport.output(),  # Audio back to meeting
+     ])
+ 
+     task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True, check_dangling_tasks=True))
+@@ -353,17 +412,13 @@ async def main(
+ 
+     if entry_message:
+         log_and_flush(logging.INFO, "[BOT] Bot will speak first with an introduction")
+-        initial_message = {"role": "user", "content": entry_message}
++        initial_message = {"role": "user", "content": f"Please introduce yourself briefly. Say: {entry_message}"}
+         async def queue_initial_message():
+-            log_and_flush(logging.INFO, "[BOT] Waiting 2 seconds before sending initial message")
+-            await asyncio.sleep(2)
++            log_and_flush(logging.INFO, "[BOT] Waiting 20 seconds for meeting connection before greeting")
++            await asyncio.sleep(20)
+             log_and_flush(logging.INFO, f"[BOT] Queuing initial message: {initial_message}")
+             await task.queue_frames([LLMMessagesFrame([initial_message])])
+             log_and_flush(logging.INFO, "[BOT] Initial greeting message queued successfully")
+-            
+-            # Also queue a simple TTS test
+-            await asyncio.sleep(1)
+-            await test_tts_output()
+         asyncio.create_task(queue_initial_message())
+     else:
+         log_and_flush(logging.INFO, "[BOT] No entry message configured")
+@@ -381,6 +436,18 @@ async def main(
+ 
+ 
+ if __name__ == "__main__":
++    # Debug: trap all signals to find what's killing us
++    import signal as _signal
++    import traceback as _tb
++    def _debug_signal_handler(signum, frame):
++        sig_name = _signal.Signals(signum).name
++        print(f"[SIGNAL-DEBUG] Received {sig_name} (signum={signum})", flush=True)
++        print(f"[SIGNAL-DEBUG] Stack trace:", flush=True)
++        _tb.print_stack(frame)
++    for _s in (_signal.SIGTERM, _signal.SIGINT, _signal.SIGUSR1, _signal.SIGUSR2, _signal.SIGALRM):
++        _signal.signal(_s, _debug_signal_handler)
++    print("[SIGNAL-DEBUG] Signal handlers installed", flush=True)
++
+     # Parse command line arguments
+     parser = argparse.ArgumentParser(description="Run a MeetingBaas bot")
+     parser.add_argument("--meeting-url", help="URL of the meeting to join")
+@@ -445,5 +512,6 @@ if __name__ == "__main__":
+             streaming_audio_frequency=args.streaming_audio_frequency,
+             websocket_url=args.websocket_url,
+             enable_tools=args.enable_tools,
++            persona_data_json=args.persona_data_json or "",
+         )
+     )
