@@ -353,6 +353,22 @@ Claude's 200K context window can hold ~400 pages of business documents in a sing
 
 ---
 
+## Pipecat Bridge Integration
+
+The OpenClaw agent serves as the "brain" for the Pipecat voice pipeline in meetings, replacing the direct `AnthropicLLMService` call. Instead of Pipecat calling Claude directly, it routes through the OpenClaw agent which adds:
+
+- **Persistent memory** — MEMORY.md and meeting history loaded into every response
+- **Business context** — Client profiles, project details, and accumulated knowledge
+- **Unified personality** — Same SOUL.md governs both Telegram and meeting interactions
+- **Wake word filtering** — Only process utterances that address "Honk", saving LLM costs
+- **Post-meeting processing** — Automatic transcript saving, summary generation, and memory updates
+
+The bridge uses a local HTTP API: Pipecat sends transcripts, OpenClaw loads context + calls Claude + returns streaming responses.
+
+**See [OpenClaw Bridge Spec](openclaw-bridge.md) for full architecture and implementation details.**
+
+---
+
 ## Configuration Checklist
 
 | Item | File | Status |

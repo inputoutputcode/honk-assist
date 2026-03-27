@@ -322,6 +322,64 @@ OpenClaw processes the command:
 
 ---
 
+## Known Audio Issues & Mitigations
+
+### Google Meet: Silent Audio
+
+**Status:** Likely a MeetingBaas bug — not fixable on our end.
+
+During testing, Google Meet delivers 320-byte audio frames that are **all zeros** (complete silence). The Pipecat pipeline receives audio data of the correct frame size, but every sample is zero. This means the bot cannot hear any participants on Google Meet.
+
+- **Root cause:** MeetingBaas's Google Meet integration appears to not properly capture participant audio
+- **Gain amplification:** `router.py` already applies **15x gain** to incoming audio — but amplifying zeros still produces zeros
+- **Audio monitoring:** The codebase has built-in audio level monitoring in `router.py` that logs RMS, peak amplitude, and non-zero sample counts per frame — useful for diagnosing this
+- **Recommendation:** Contact MeetingBaas support about the Google Meet silent audio issue. **Focus testing on Microsoft Teams**, which delivers real speech data
+
+### Zoom: Sparse/Quiet Audio
+
+Zoom delivers 3200-byte frames (10x larger than Meet/Teams), but audio is sparse and quiet. The 15x gain in `router.py` helps somewhat. Zoom web client mode may contribute to audio quality issues.
+
+### Microsoft Teams: Best Audio Quality
+
+Teams delivers 320-byte frames with bursty but real speech data. This is currently the **most reliable platform** for voice interaction testing.
+
+### Audio Sample Rate Mismatch
+
+The pipeline currently uses mismatched sample rates:
+- **STT input (Deepgram):** 16kHz
+- **TTS output (ElevenLabs):** 24kHz
+
+Matching both at **16kHz** could:
+- Reduce bandwidth requirements
+- Minimize audio format conversion glitches
+- Potentially help with choppy audio on constrained connections
+
+The ElevenLabs `output_format` parameter already supports `pcm_16000` — switching TTS to 16kHz is a config change.
+
+---
+
+## MeetingBaas & ElevenLabs Free Tier Limitations
+
+### MeetingBaas Pricing
+
+- **Free tier:** 4 hours of bot time (one-time)
+- **After free tier:** $0.69/hr per bot in a meeting
+- The speaking bot functionality uses their persona system with predefined personas and animated avatars
+
+### Custom Prompts
+
+Custom prompts **are supported** via the `prompt` field in the `BotRequest` payload. This allows overriding the default persona behavior with HonkAssist's own system prompt.
+
+### ElevenLabs Voice Limitations
+
+- **Current voice ID:** `9IzcwKmvwJcw58h3KnlH` (fixed/predefined)
+- The current ElevenLabs API key (`sk_c5ddd316...`) is **missing the `user_read` permission** — cannot check remaining credits or account status via API
+- **Free tier:** Limited voice selection — cannot use custom/cloned voices
+- **To use custom voices:** Requires a paid ElevenLabs plan
+- Voice cloning and custom voice IDs are gated behind ElevenLabs paid tiers
+
+---
+
 ## Future Improvements
 
 | Improvement | Benefit | Complexity |

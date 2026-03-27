@@ -17,7 +17,7 @@ graph TB
     
     subgraph Cloud["Cloud APIs"]
         DG["Deepgram<br/>STT"]
-        AN["Claude API<br/>LLM"]
+        AN["Claude API<br/>LLM (via OpenClaw)"]
         EL["ElevenLabs<br/>TTS"]
         MB["MeetingBaas<br/>Meeting Bot"]
     end
@@ -30,7 +30,7 @@ graph TB
     
     TG["Telegram<br/>(Android)"] <--> OC
     PC <--> DG
-    PC <--> AN
+    PC <--> OC
     PC <--> EL
     PC <--> MB
     MB <--> GM
@@ -62,6 +62,7 @@ graph TB
 - Handles VAD (Voice Activity Detection) and turn-taking
 - Connects to MeetingBaas for meeting audio
 - Runs as a separate systemd service
+- **LLM calls route through OpenClaw agent** (not direct Anthropic API) for persistent memory and context — see [OpenClaw Bridge Spec](specs/openclaw-bridge.md)
 
 **Why Pipecat?** Open-source, pluggable provider architecture, optimized for streaming audio with built-in interruption handling. Apache 2.0 license.
 
@@ -99,6 +100,7 @@ sequenceDiagram
     participant M as Meeting<br/>(via MeetingBaas)
     participant P as Pipecat
     participant D as Deepgram
+    participant OCA as OpenClaw Agent
     participant C as Claude Haiku
     participant E as ElevenLabs
     
@@ -107,10 +109,13 @@ sequenceDiagram
     D-->>P: Transcript + speaker labels (streaming)
     
     Note over P: VAD detects end of utterance
-    Note over P: "Should I respond?" gate
+    Note over P: Wake word filter:<br/>"Honk" detected?
     
-    P->>C: Transcript + context + system prompt
-    C-->>P: Response tokens (streaming)
+    P->>OCA: Transcript (only when "Honk" addressed)
+    OCA->>OCA: Load MEMORY.md + meeting context
+    OCA->>C: Transcript + memory + system prompt
+    C-->>OCA: Response tokens (streaming)
+    OCA-->>P: Response tokens (streaming)
     
     P->>E: First sentence of response
     E-->>P: Audio chunks (streaming)
